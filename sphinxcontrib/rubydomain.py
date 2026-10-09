@@ -12,16 +12,18 @@
 import re
 
 from docutils import nodes
-from docutils.parsers.rst import directives
+from docutils.parsers.rst import Directive, directives
 
 from sphinx import addnodes
 from sphinx.roles import XRefRole
-from sphinx.locale import l_, _
+from sphinx.locale import _
 from sphinx.domains import Domain, ObjType, Index
 from sphinx.directives import ObjectDescription
+from sphinx.util import logging
 from sphinx.util.nodes import make_refnode
-from sphinx.util.compat import Directive
 from sphinx.util.docfields import Field, GroupedField, TypedField
+
+logger = logging.getLogger(__name__)
 
 
 # REs for Ruby signatures
@@ -43,12 +45,6 @@ separators = {
 rb_separator = re.compile(r"(?:\w+)?(?:::)?(?:\.)?(?:#)?")
 
 
-def _iteritems(d):
-
-    for k in d:
-        yield k, d[k]
-
-
 def ruby_rsplit(fullname):
     items = [item for item in rb_separator.findall(fullname)]
     return ''.join(items[:-2]), items[-1]
@@ -64,18 +60,18 @@ class RubyObject(ObjectDescription):
     }
 
     doc_field_types = [
-        TypedField('parameter', label=l_('Parameters'),
+        TypedField('parameter', label=_('Parameters'),
                    names=('param', 'parameter', 'arg', 'argument'),
                    typerolename='obj', typenames=('paramtype', 'type')),
-        TypedField('variable', label=l_('Variables'), rolename='obj',
+        TypedField('variable', label=_('Variables'), rolename='obj',
                    names=('var', 'ivar', 'cvar'),
                    typerolename='obj', typenames=('vartype',)),
-        GroupedField('exceptions', label=l_('Raises'), rolename='exc',
+        GroupedField('exceptions', label=_('Raises'), rolename='exc',
                      names=('raises', 'raise', 'exception', 'except'),
                      can_collapse=True),
-        Field('returnvalue', label=l_('Returns'), has_arg=False,
+        Field('returnvalue', label=_('Returns'), has_arg=False,
               names=('returns', 'return')),
-        Field('returntype', label=l_('Return type'), has_arg=False,
+        Field('returntype', label=_('Return type'), has_arg=False,
               names=('rtype',)),
     ]
 
@@ -95,7 +91,8 @@ class RubyObject(ObjectDescription):
     def handle_signature(self, sig, signode):
         """
         Transform a Ruby signature into RST nodes.
-        Returns (fully qualified name of the thing, classname if any).
+        Returns the fully qualified name of the thing; the classname (name
+        prefix), if any, is stored on ``self.name_prefix``.
 
         If inside a class, the current class name is handled intelligently:
         * it is stripped from the displayed name if present
@@ -164,7 +161,8 @@ class RubyObject(ObjectDescription):
                 signode += addnodes.desc_parameterlist()
             if retann:
                 signode += addnodes.desc_returns(retann, retann)
-            return fullname, name_prefix
+            self.name_prefix = name_prefix
+            return fullname
         signode += addnodes.desc_parameterlist()
 
         stack = [signode[-1]]
@@ -187,7 +185,8 @@ class RubyObject(ObjectDescription):
             raise ValueError
         if retann:
             signode += addnodes.desc_returns(retann, retann)
-        return fullname, name_prefix
+        self.name_prefix = name_prefix
+        return fullname
 
     def get_index_text(self, modname, name):
         """
@@ -198,7 +197,7 @@ class RubyObject(ObjectDescription):
     def _is_class_member(self):
         return self.objtype.endswith('method') or self.objtype.startswith('attr')
 
-    def add_target_and_index(self, name_cls, sig, signode):
+    def add_target_and_index(self, name, sig, signode):
         if self.objtype == 'global':
             modname = ''
         else:
@@ -212,27 +211,26 @@ class RubyObject(ObjectDescription):
                 prefix = modname and modname + separator or ''
         else:
             prefix = modname and modname + separator or ''
-        fullname = prefix + name_cls[0]
+        fullname = prefix + name
         # note target
         if fullname not in self.state.document.ids:
             signode['names'].append(fullname)
             signode['ids'].append(fullname)
-            signode['first'] = (not self.names)
             self.state.document.note_explicit_target(signode)
             objects = self.env.domaindata['rb']['objects']
             if fullname in objects:
-                self.env.warn(
-                    self.env.docname,
-                    'duplicate object description of %s, ' % fullname +
-                    'other instance in ' +
-                    self.env.doc2path(objects[fullname][0]),
-                    self.lineno)
+                logger.warning(
+                    'duplicate object description of %s, '
+                    'other instance in %s',
+                    fullname, self.env.doc2path(objects[fullname][0]),
+                    location=(self.env.docname, self.lineno))
             objects[fullname] = (self.env.docname, self.objtype)
 
-        indextext = self.get_index_text(modname, name_cls)
+        indextext = self.get_index_text(
+            modname, (name, getattr(self, 'name_prefix', None)))
         if indextext:
             self.indexnode['entries'].append(('single', indextext,
-                                              fullname, fullname))
+                                              fullname, fullname, None))
 
     def before_content(self):
         # needed for automatic qualification of members (reset in subclasses)
@@ -321,7 +319,7 @@ class RubyClasslike(RubyObject):
     def before_content(self):
         RubyObject.before_content(self)
         if self.names:
-            self.env.temp_data['rb:class'] = self.names[0][0]
+            self.env.temp_data['rb:class'] = self.names[0]
             self.clsname_set = True
 
 
@@ -371,7 +369,7 @@ class RubyClassmember(RubyObject):
 
     def before_content(self):
         RubyObject.before_content(self)
-        lastname = self.names and self.names[-1][1]
+        lastname = getattr(self, 'name_prefix', None)
         if lastname and not self.env.temp_data.get('rb:class'):
             self.env.temp_data['rb:class'] = lastname.strip('.')
             self.clsname_set = True
@@ -416,7 +414,8 @@ class RubyModule(Directive):
         if not noindex:
             indextext = _('%s (module)') % modname
             inode = addnodes.index(entries=[('single', indextext,
-                                             'module-' + modname, modname)])
+                                             'module-' + modname, modname,
+                                             None)])
             ret.append(inode)
         return ret
 
@@ -474,8 +473,8 @@ class RubyModuleIndex(Index):
     """
 
     name = 'modindex'
-    localname = l_('Ruby Module Index')
-    shortname = l_('modules')
+    localname = _('Ruby Module Index')
+    shortname = _('modules')
 
     def generate(self, docnames=None):
         content = {}
@@ -483,7 +482,7 @@ class RubyModuleIndex(Index):
         ignores = self.domain.env.config['modindex_common_prefix']
         ignores = sorted(ignores, key=len, reverse=True)
         # list of all modules, sorted by module name
-        modules = sorted(_iteritems(self.domain.data['modules']),
+        modules = sorted(self.domain.data['modules'].items(),
                          key=lambda x: x[0].lower())
         # sort out collapsable modules
         prev_modname = ''
@@ -532,7 +531,7 @@ class RubyModuleIndex(Index):
         collapse = len(modules) - num_toplevels < num_toplevels
 
         # sort by first letter
-        content = sorted(_iteritems(content))
+        content = sorted(content.items())
 
         return content, collapse
 
@@ -542,17 +541,17 @@ class RubyDomain(Domain):
     name = 'rb'
     label = 'Ruby'
     object_types = {
-        'function':        ObjType(l_('function'),         'func', 'obj'),
-        'global':          ObjType(l_('global variable'),  'global', 'obj'),
-        'method':          ObjType(l_('method'),           'meth', 'obj'),
-        'class':           ObjType(l_('class'),            'class', 'obj'),
-        'exception':       ObjType(l_('exception'),        'exc', 'obj'),
-        'classmethod':     ObjType(l_('class method'),     'meth', 'obj'),
-        'attr_reader':     ObjType(l_('attribute'),        'attr', 'obj'),
-        'attr_writer':     ObjType(l_('attribute'),        'attr', 'obj'),
-        'attr_accessor':   ObjType(l_('attribute'),        'attr', 'obj'),
-        'const':           ObjType(l_('const'),            'const', 'obj'),
-        'module':          ObjType(l_('module'),           'mod', 'obj'),
+        'function':        ObjType(_('function'),         'func', 'obj'),
+        'global':          ObjType(_('global variable'),  'global', 'obj'),
+        'method':          ObjType(_('method'),           'meth', 'obj'),
+        'class':           ObjType(_('class'),            'class', 'obj'),
+        'exception':       ObjType(_('exception'),        'exc', 'obj'),
+        'classmethod':     ObjType(_('class method'),     'meth', 'obj'),
+        'attr_reader':     ObjType(_('attribute'),        'attr', 'obj'),
+        'attr_writer':     ObjType(_('attribute'),        'attr', 'obj'),
+        'attr_accessor':   ObjType(_('attribute'),        'attr', 'obj'),
+        'const':           ObjType(_('const'),            'const', 'obj'),
+        'module':          ObjType(_('module'),           'mod', 'obj'),
     }
 
     directives = {
@@ -685,11 +684,16 @@ class RubyDomain(Domain):
                                     contnode, name)
 
     def get_objects(self):
-        for modname, info in _iteritems(self.data['modules']):
+        for modname, info in self.data['modules'].items():
             yield (modname, modname, 'module', info[0], 'module-' + modname, 0)
-        for refname, (docname, type) in _iteritems(self.data['objects']):
+        for refname, (docname, type) in self.data['objects'].items():
             yield (refname, refname, type, docname, refname, 1)
 
 
 def setup(app):
     app.add_domain(RubyDomain)
+    return {
+        'version': '1.0',
+        'parallel_read_safe': True,
+        'parallel_write_safe': True,
+    }
